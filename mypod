@@ -1,0 +1,314 @@
+#!/usr/bin/env python3
+"""
+A minimal podcast downloader wihch does mainly what I want.
+
+It takes a file with a list of podcast URLs as an argument and a destination
+directory as another. Optionally, you can set the log level.
+
+The podcast episodes are placed in subdirectories and the filenames prefixed
+with the name and datetime of the series. This allows for natural sorting. The
+episode names will be stripped of characters which don't play nicely with
+shells, for (my) convnience.
+
+Meta-data is put into a dot-directory. This allows the script to determine what
+has already been downloaded, for example. Attempts are also made to use the
+podcast meta-data to add ID3 tags to the mp3 files, if they happen to be
+missing.
+
+Example usage::
+    mypod ~/.mypod_urls ~/Music/Podcasts
+
+The URL looks like this::
+    # The Science Hour
+    https://podcasts.files.bbci.co.uk/p016tmt2.rss
+    # In Our Time
+    https://podcasts.files.bbci.co.uk/b006qykl.rss
+where lines starting with a ``#`` are treated as comments.
+
+As I said, minimal.
+"""
+
+# ------------------------------------------------------------------------------
+
+# Set up the logger. We need to do this first since some of the
+# imports seem to mess with it.
+import logging
+
+LOG = logging
+LOG.basicConfig(
+    format='[%(asctime)s %(filename)s:%(lineno)d %(levelname)s] %(message)s'
+)
+
+# We need to send headers for some RSS feeds to permit reading
+_HEADERS = {'User-Agent': 'Mozilla/5.0'}
+
+# ----------------------------------------------------------------------
+
+from   urllib.request import Request, urlopen
+from   unidecode      import unidecode
+
+import argparse
+import eyed3
+import os
+import podcastparser
+import time
+
+def do_feed(outdir, feedurl):
+    """
+    Handle a particular podcast feed. Download its contents to the
+    given base directory.
+    """
+    LOG.info("Downloading feed %s" % (feedurl,))
+
+    # Load in the feed information
+    try:
+        request = Request(feedurl, headers=_HEADERS)
+        parsed  = podcastparser.parse(feedurl, urlopen(request))
+    except Exception as e:
+        LOG.error("Failed to get %s: %s" % (feedurl, e))
+        return
+
+    # We need a title for this to work
+    show_title = parsed.get('title', None)
+    if show_title is None:
+        LOG.error("No title for %s" % (feedurl,))
+        return
+    show_title = show_title.strip()
+    LOG.info("%s is '%s'" % (feedurl, show_title))
+
+    # Grab some things which we might care about
+    cover_url = parsed.get('cover_url', None)
+
+    # The output directory is this
+    outdir = os.path.join(outdir, unspace(show_title))
+    os.makedirs(outdir, exist_ok=True)
+    dbdir = os.path.join(outdir, '.db')
+    os.makedirs(dbdir, exist_ok=True)
+
+    # See if we have the cover
+    if cover_url is not None:
+        # Strip any URL info from the end of the extension
+        (_, ext) = os.path.splitext(cover_url)
+        cover = os.path.join(outdir, 'cover' + ext)
+        if '?' in cover:
+            cover = cover[0:cover.index('?')]
+        if not os.path.exists(cover):
+            LOG.info("Downloading cover for '%s'" % show_title)
+            try:
+                get_url(cover_url, cover)
+            except Exception as e:
+                # Not fatal
+                LOG.warning("Failed to download cover for %s: %s" %
+                            (show_title, e))
+
+    # And get the episodes
+    for episode in parsed.get('episodes', tuple()):
+        do_episode(outdir, dbdir, show_title, episode)
+
+
+def do_episode(outdir, dbdir, show_title, episode):
+    """
+    Handle an episode entry in the feed output.
+    """
+    # The details which we care about
+    if 'published' in episode:
+        pubtime = time.gmtime(episode['published'])
+    else:
+        pubtime = None
+
+    title       = episode.get('title',       None)
+    subtitle    = episode.get('subtitle',    None)
+    description = episode.get('description', None)
+    guid        = episode.get('guid',        None)
+
+    # Look for the url of the episode and download it
+    url = None
+    for enclosure in episode.get('enclosures', tuple()):
+        if 'url' not in enclosure:
+            continue
+        else:
+            # We'll want these
+            url       = enclosure['url']
+            mime_type = enclosure.get('mime_type', None)
+            file_size = enclosure.get('file_size', 0)
+            break
+
+    # Any URL?
+    if url is None:
+        LOG.warning("No URL for '%s' '%s'" % (show_title, title))
+        return
+
+    # We'll want to know the filename. This could have trailing HTTP address
+    # stuff after it, following a '?', so we strip that.
+    basename = os.path.basename(url)
+    if '?' in basename:
+        basename = basename[0:basename.index('?')]
+    (_, ext) = os.path.splitext(basename)
+
+    # Determine the extension
+    if not ext:
+        if mime_type == 'audio/mpeg':
+            ext = '.mp3'
+
+    # Build up the filename
+    filename = ''
+
+    # Start with the name of the show
+    filename += show_title.strip() + '-'
+
+    # Add the date in
+    if pubtime is not None:
+        filename += time.strftime('%Y%m%d-%H%M%S', pubtime) + '-'
+
+    # And any show title
+    if title:
+        filename += title.strip() + '-'
+
+    # Remove trailing '-'s
+    filename = filename.rstrip('-')
+
+    # And the extension
+    if ext:
+        filename += ext
+
+    # Clean it up
+    filename = unspace(filename)
+
+    # Where we will put it. We also have a db-file for the guid of it which we
+    # will touch to denote a download. That way users can remove the downloaded
+    # file and we'll remember that we grabbed it already.
+    path = os.path.join(outdir, filename)
+    if guid is not None:
+        # Only replace the spaces and slash for this since it needs to be unique
+        dbpath = os.path.join(dbdir, guid.replace('/',  '~')
+                                         .replace(' ',  '_')
+                                         .replace('\t', '_')
+                                         .replace('\n', '+'))
+    else:
+        # Fall back to the filename
+        dbpath = os.path.join(dbdir, filename)
+    if os.path.exists(path) or os.path.exists(dbpath):
+        LOG.info("Already downloaded %s" % filename)
+        return
+
+    try:
+        # Grab it
+        get_url(url, path)
+
+        # And touch the dotfile
+        with open(dbpath, 'w+'):
+            pass
+
+    except Exception as e:
+        # If we got an error then there's not a lot we can do
+        LOG.error("Failed to download %s: %s" % (url, e))
+        return
+
+    # Set tags?
+    if ext == '.mp3':
+        try:
+            LOG.info("Adding tags to %s" % (path,))
+            info = eyed3.load(path)
+            tags    = info.tag
+            changed = False
+            if tags is None:
+                LOG.info("Adding tags for %s", path)
+                info.initTag()
+                tags = info.tag
+
+            if not tags.album:
+                tags.album = show_title
+                changed    = True
+            if not tags.title:
+                tags.album = title
+                changed    = True
+            if not tags.release_date and pubtime is not None:
+                tags.release_date = time.strftime('%Y-%m-%d', pubtime)
+                changed           = True
+            if not tags.comments.get('description') is None:
+                tags.comments.set(description, 'description')
+                changed = True
+            if not tags.comments.get('subtitle') is None:
+                tags.comments.set(subtitle, 'subtitle')
+                changed = True
+
+            # And save out any changes
+            if changed:
+                LOG.info("Saving tags for %s", path)
+                tags.save()
+
+        except Exception as e:
+            LOG.warning("Failed to tag %s: %s" % (path, e))
+
+    # And we're done!
+
+
+def get_url(url, filename):
+    """
+    Get a URL and save it as the given filename. We grab it as a
+    temporary name to start with, in case of errors along the way.
+
+    @throw: Exception in the event of failure.
+    """
+    # Say what we're doing
+    LOG.info("Downloading %s to %s" % (url, filename))
+    tmpfile = '%s%s%s' % (filename, os.path.extsep, 'partial')
+
+    # Get it and rename from the partial file to the actual one
+    request = Request(url, headers=_HEADERS)
+    with urlopen(request)    as src, \
+         open(tmpfile, 'wb') as dst:
+        dst.write(src.read())
+    os.rename(tmpfile, filename)
+
+
+def unspace(filename):
+    """
+    Given a filename, remove spaces and other unwanted characters.
+    """
+    # First remove any unicode
+    filename = unidecode(filename)
+
+    # Now replace characters which don't play nicely with filesystems etc.
+    filename = filename.replace(' ',  '_')
+    filename = filename.replace('/',  '_')
+    filename = filename.replace('&',  'and')
+    filename = filename.replace('!',  '')
+    filename = filename.replace('*',  '')
+    filename = filename.replace('|',  '')
+    filename = filename.replace("'",  '')
+    filename = filename.replace('?',  '')
+    filename = filename.replace(':',  '')
+    filename = filename.replace(';',  '')
+    filename = filename.replace('\\', '')
+
+    # And give it back
+    return filename
+
+# ----------------------------------------------------------------------
+
+if __name__ == "__main__":
+    # Get the command line arguments
+    parser = argparse.ArgumentParser(description='Download podcasts')
+    parser.add_argument('url_file', metavar='url_file',
+                        help='The file containing the list of URLs to parse')
+    parser.add_argument('out_dir', metavar='out_dir',
+                        help='The directory to put the podcasts into')
+    parser.add_argument('--log-level', '-l', dest='log_level',
+                        help='Set the log level to this')
+    args = parser.parse_args()
+
+    # Handle optional arguments
+    if args.log_level:
+        LOG.getLogger().setLevel(args.log_level.upper())
+
+    # eyed3 can be noisy
+    eyed3.log.setLevel("ERROR")
+
+    # Read in the config file and get all the podcasts
+    with open(args.url_file, 'r') as fh:
+        lines = fh.readlines()
+        for line in lines:
+            line = line.strip()
+            if len(line) > 0 and not line[0] == '#':
+                do_feed(args.out_dir, line)
