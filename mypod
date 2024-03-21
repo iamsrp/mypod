@@ -195,9 +195,10 @@ def do_episode(outdir, dbdir, show_title, episode):
         # Grab it
         get_url(url, path)
 
-        # And touch the dotfile
-        with open(dbpath, 'w+'):
-            pass
+        # And put the filename into the dotfile, which also creates it
+        with open(dbpath, 'w+') as fh:
+            fh.write(filename)
+            fh.write('\n')
 
     except Exception as e:
         # If we got an error then there's not a lot we can do
